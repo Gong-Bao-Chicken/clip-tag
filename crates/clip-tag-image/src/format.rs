@@ -6,7 +6,6 @@ pub enum ImageFormat {
     Jpeg,
     Png,
     Tiff,
-    Dng,
 }
 
 impl ImageFormat {
@@ -15,26 +14,7 @@ impl ImageFormat {
             "jpg" | "jpeg" => Some(Self::Jpeg),
             "png" => Some(Self::Png),
             "tif" | "tiff" => Some(Self::Tiff),
-            "dng" => Some(Self::Dng),
             _ => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ImageFormat;
-    use std::path::Path;
-
-    #[test]
-    fn recognizes_dng_case_insensitively() {
-        assert_eq!(
-            ImageFormat::from_path(Path::new("a.dng")),
-            Some(ImageFormat::Dng)
-        );
-        assert_eq!(
-            ImageFormat::from_path(Path::new("a.DNG")),
-            Some(ImageFormat::Dng)
-        );
     }
 }

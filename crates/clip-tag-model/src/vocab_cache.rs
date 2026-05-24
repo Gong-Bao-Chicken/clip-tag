@@ -10,17 +10,19 @@ use crate::{Error, Result};
 const MAGIC: &[u8; 8] = b"CLIPTAG1";
 
 pub fn cache_path_for(vocab_path: &Path, model_id: &str) -> PathBuf {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash, Hasher};
-    vocab_path.hash(&mut hasher);
-    model_id.hash(&mut hasher);
-    let hash = hasher.finish();
+    let canonical = std::fs::canonicalize(vocab_path).unwrap_or_else(|_| vocab_path.to_path_buf());
+    let canonical_str = canonical.to_string_lossy();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(canonical_str.as_bytes());
+    hasher.update(&[0]); // Delimiter so path/model_id boundaries are unambiguous.
+    hasher.update(model_id.as_bytes());
+    let hash = hasher.finalize().to_hex();
 
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("clip-tag")
         .join("vocab-cache")
-        .join(format!("{hash:016x}.bin"))
+        .join(format!("{hash}.bin"))
 }
 
 pub fn load_cache(path: &Path, label_count: usize) -> Result<Array2<f32>> {
@@ -91,4 +93,57 @@ pub fn embed_labels(text: &TextEmbedder, labels: &[String]) -> Result<Array2<f32
         });
     }
     out.ok_or_else(|| Error::Load("empty vocabulary".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_path_for;
+
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn cache_path_is_stable_for_equivalent_paths() {
+        let dir = tempdir().expect("temp dir");
+        let vocab = dir.path().join("vocab.txt");
+        std::fs::write(&vocab, "token").expect("write vocab");
+
+        let from_plain = cache_path_for(&vocab, "test-model");
+        let from_equivalent = cache_path_for(
+            Path::new(&dir.path().join(".").join("vocab.txt")),
+            "test-model",
+        );
+
+        assert_eq!(from_plain, from_equivalent);
+    }
+
+    #[test]
+    fn cache_path_changes_when_model_changes() {
+        let dir = tempdir().expect("temp dir");
+        let vocab = dir.path().join("vocab.txt");
+        std::fs::write(&vocab, "token").expect("write vocab");
+
+        let model_a = cache_path_for(&vocab, "model-a");
+        let model_b = cache_path_for(&vocab, "model-b");
+
+        assert_ne!(model_a, model_b);
+    }
+
+    #[test]
+    fn cache_file_name_is_hex_and_safe() {
+        let dir = tempdir().expect("temp dir");
+        let vocab = dir.path().join("vocab.txt");
+        std::fs::write(&vocab, "token").expect("write vocab");
+
+        let path = cache_path_for(&vocab, "model");
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("utf-8 file name");
+
+        assert_eq!(file_name.len(), 68); // 64-char digest + ".bin"
+        assert!(file_name.ends_with(".bin"));
+        assert!(file_name[..64].chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

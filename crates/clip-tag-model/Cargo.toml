@@ -7,6 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3 = "1.8.5"
 clip-tag-image.workspace = true
 dirs.workspace = true
 hf-hub.workspace = true

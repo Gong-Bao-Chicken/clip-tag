@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clip_tag_model::{ModelConfig, SharedEngine, TagScore, TaggingEngine};
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::config::{BatchConfig, Config, WriteConfig};
@@ -98,66 +99,23 @@ impl Pipeline {
         let paths = match Self::discover_paths(root, self.config.batch.recursive) {
             Ok(p) => p,
             Err(e) => {
-                return BatchResult {
-                    files: vec![FileTagResult {
-                        path: root.display().to_string(),
-                        tags: vec![],
-                        write: None,
-                        error: Some(e.to_string()),
-                    }],
-                    succeeded: 0,
-                    failed: 1,
-                };
+                return batch_error_result(root, format!("discover_paths failed: {e}"));
             }
         };
 
         if paths.is_empty() {
-            return BatchResult {
-                files: vec![FileTagResult {
-                    path: root.display().to_string(),
-                    tags: vec![],
-                    write: None,
-                    error: Some("no supported images found".into()),
-                }],
-                succeeded: 0,
-                failed: 1,
-            };
+            return batch_error_result(root, "no supported images found".to_string());
         }
 
-        let continue_on_error = self.config.batch.continue_on_error;
-        let mut files = Vec::new();
-        let mut succeeded = 0usize;
-        let mut failed = 0usize;
-
-        for path in paths {
-            match self.process_file(&path, top_k, threshold) {
-                Ok(result) => {
-                    succeeded += 1;
-                    files.push(result);
-                }
-                Err(e) => {
-                    failed += 1;
-                    files.push(FileTagResult {
-                        path: path.display().to_string(),
-                        tags: vec![],
-                        write: None,
-                        error: Some(e.to_string()),
-                    });
-                    if !continue_on_error {
-                        break;
-                    }
-                }
-            }
-        }
-
-        BatchResult {
-            files,
-            succeeded,
-            failed,
-        }
+        run_batch_paths(paths, self.config.batch.continue_on_error, |path| {
+            self.process_file(path, top_k, threshold)
+        })
     }
 
     fn process_file(&self, path: &Path, top_k: usize, threshold: f32) -> Result<FileTagResult> {
+        if let Some(skip_result) = self.precheck_skip_without_inference(path)? {
+            return Ok(skip_result);
+        }
         let fetch_k = tag_fetch_k(top_k, threshold);
         let mut tags = self.engine.tag_path(path, fetch_k)?;
         tags = filter_tags_by_threshold(tags, threshold);
@@ -169,6 +127,35 @@ impl Pipeline {
             write,
             error: None,
         })
+    }
+
+    fn precheck_skip_without_inference(&self, path: &Path) -> Result<Option<FileTagResult>> {
+        let write_cfg = &self.config.write;
+        if !write_cfg.enabled && !write_cfg.dry_run {
+            return Ok(None);
+        }
+        if write_cfg.force || write_cfg.mode != WriteMode::EmptyOnly {
+            return Ok(None);
+        }
+
+        let current = read_snapshot_external(path)?;
+        let has_existing = crate::write::MetadataField::all()
+            .iter()
+            .any(|field| current.get(*field).is_some());
+        if !has_existing {
+            return Ok(None);
+        }
+
+        Ok(Some(FileTagResult {
+            path: path.display().to_string(),
+            tags: vec![],
+            write: Some(FileWriteResult {
+                decision: "skip: target keyword fields are already populated".into(),
+                dry_run: None,
+                applied: false,
+            }),
+            error: None,
+        }))
     }
 
     fn maybe_write_metadata(
@@ -234,7 +221,9 @@ pub(crate) fn tag_fetch_k(top_k: usize, threshold: f32) -> usize {
         return top_k;
     }
     const OVERSAMPLE: usize = 5;
-    top_k.saturating_mul(OVERSAMPLE).max(top_k.saturating_add(20))
+    top_k
+        .saturating_mul(OVERSAMPLE)
+        .max(top_k.saturating_add(20))
 }
 
 pub(crate) fn filter_tags_by_threshold(tags: Vec<TagScore>, threshold: f32) -> Vec<TagScore> {
@@ -242,6 +231,75 @@ pub(crate) fn filter_tags_by_threshold(tags: Vec<TagScore>, threshold: f32) -> V
         return tags;
     }
     tags.into_iter().filter(|t| t.score >= threshold).collect()
+}
+
+fn batch_error_result(path: &Path, error: String) -> BatchResult {
+    BatchResult {
+        files: vec![FileTagResult {
+            path: path.display().to_string(),
+            tags: vec![],
+            write: None,
+            error: Some(error),
+        }],
+        succeeded: 0,
+        failed: 1,
+    }
+}
+
+fn run_batch_paths<F>(paths: Vec<PathBuf>, continue_on_error: bool, process_file: F) -> BatchResult
+where
+    F: Fn(&Path) -> Result<FileTagResult> + Sync,
+{
+    if continue_on_error {
+        let files: Vec<FileTagResult> = paths
+            .into_par_iter()
+            .map(|path| match process_file(&path) {
+                Ok(result) => result,
+                Err(e) => FileTagResult {
+                    path: path.display().to_string(),
+                    tags: vec![],
+                    write: None,
+                    error: Some(e.to_string()),
+                },
+            })
+            .collect();
+
+        let failed = files.iter().filter(|r| r.error.is_some()).count();
+        let succeeded = files.len().saturating_sub(failed);
+        return BatchResult {
+            files,
+            succeeded,
+            failed,
+        };
+    }
+
+    let mut files = Vec::new();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for path in paths {
+        match process_file(&path) {
+            Ok(result) => {
+                succeeded += 1;
+                files.push(result);
+            }
+            Err(e) => {
+                failed += 1;
+                files.push(FileTagResult {
+                    path: path.display().to_string(),
+                    tags: vec![],
+                    write: None,
+                    error: Some(e.to_string()),
+                });
+                break;
+            }
+        }
+    }
+
+    BatchResult {
+        files,
+        succeeded,
+        failed,
+    }
 }
 
 /// Metadata I/O is injected from CLI to avoid core ↔ metadata cycle.
@@ -304,8 +362,10 @@ impl TagProvider for LocalOnnxProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_tags_by_threshold, tag_fetch_k};
+    use super::{filter_tags_by_threshold, run_batch_paths, tag_fetch_k, FileTagResult};
+    use crate::Error;
     use clip_tag_model::TagScore;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn threshold_filter_is_applied() {
@@ -351,12 +411,63 @@ mod tests {
         let out = filter_tags_by_threshold(tags, 0.0);
         assert_eq!(out.len(), 2);
     }
+
+    #[test]
+    fn run_batch_parallel_keeps_discovery_order_and_counts() {
+        let paths = vec![
+            PathBuf::from("a.jpg"),
+            PathBuf::from("b.jpg"),
+            PathBuf::from("c.jpg"),
+            PathBuf::from("d.jpg"),
+        ];
+        let result = run_batch_paths(paths, true, |path| match path.to_string_lossy().as_ref() {
+            "a.jpg" | "c.jpg" => Ok(FileTagResult {
+                path: path.display().to_string(),
+                tags: vec![],
+                write: None,
+                error: None,
+            }),
+            _ => Err(Error::Image("boom".into())),
+        });
+
+        let ordered_paths: Vec<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(ordered_paths, vec!["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        assert_eq!(result.succeeded, 2);
+        assert_eq!(result.failed, 2);
+    }
+
+    #[test]
+    fn run_batch_sequential_fail_fast_stops_after_first_error() {
+        let paths = vec![
+            PathBuf::from("first.jpg"),
+            PathBuf::from("second.jpg"),
+            PathBuf::from("third.jpg"),
+        ];
+        let result = run_batch_paths(paths, false, |path| {
+            if path == Path::new("second.jpg") {
+                Err(Error::Image("stop".into()))
+            } else {
+                Ok(FileTagResult {
+                    path: path.display().to_string(),
+                    tags: vec![],
+                    write: None,
+                    error: None,
+                })
+            }
+        });
+
+        let ordered_paths: Vec<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(ordered_paths, vec!["first.jpg", "second.jpg"]);
+        assert_eq!(result.succeeded, 1);
+        assert_eq!(result.failed, 1);
+    }
 }
 
 pub fn default_config_from_cli(
     write_metadata: bool,
     dry_run: bool,
     force: bool,
+    write_mode: WriteMode,
     recursive: bool,
     model_id: Option<String>,
     provider: Option<String>,
@@ -369,7 +480,7 @@ pub fn default_config_from_cli(
             mode: if force {
                 WriteMode::ForceOverwrite
             } else {
-                WriteMode::EmptyOnly
+                write_mode
             },
             dry_run,
             force,

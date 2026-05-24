@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use clip_tag_core::pipeline::{self, MetadataIoHooks, Pipeline};
+use clip_tag_core::policy::WriteMode;
 use clip_tag_core::{default_config_from_cli, logging};
 use clip_tag_metadata::{execute_plan, read_field_snapshot};
 
@@ -35,29 +36,37 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
+    /// Metadata write policy.
+    #[arg(long, value_enum, default_value_t = WriteModeArg::EmptyOnly)]
+    write_mode: WriteModeArg,
+
+    /// Quality preset (expert flags can override specific values).
+    #[arg(long, value_enum, default_value_t = QualityArg::Balanced)]
+    quality: QualityArg,
+
     /// Number of tags to return per image.
-    #[arg(long, default_value = "10")]
-    top_k: usize,
+    #[arg(long)]
+    top_k: Option<usize>,
 
     /// Hugging Face model id (ONNX CLIP).
     #[arg(long)]
     model: Option<String>,
 
     /// Execution provider preference.
-    #[arg(long, value_enum, default_value_t = ProviderArg::Auto)]
-    provider: ProviderArg,
+    #[arg(long, value_enum)]
+    provider: Option<ProviderArg>,
 
     /// Custom vocabulary file (one label per line).
     #[arg(long)]
     vocab: Option<PathBuf>,
 
     /// Minimum tag score to include in metadata writes.
-    #[arg(long, default_value = "0.01")]
-    threshold: f32,
+    #[arg(long)]
+    threshold: Option<f32>,
 
     /// Max cosine similarity allowed between selected tags (lower = more diverse).
-    #[arg(long, default_value = "0.8")]
-    diversity_threshold: f32,
+    #[arg(long)]
+    diversity_threshold: Option<f32>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -76,6 +85,9 @@ enum Commands {
 enum ProviderArg {
     Auto,
     Cpu,
+    Metal,
+    Coreml,
+    Directml,
 }
 
 impl ProviderArg {
@@ -83,7 +95,62 @@ impl ProviderArg {
         match self {
             Self::Auto => "auto",
             Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Coreml => "coreml",
+            Self::Directml => "directml",
         }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum WriteModeArg {
+    EmptyOnly,
+    Merge,
+}
+
+impl WriteModeArg {
+    fn into_write_mode(self) -> WriteMode {
+        match self {
+            Self::EmptyOnly => WriteMode::EmptyOnly,
+            Self::Merge => WriteMode::Merge,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum QualityArg {
+    Fast,
+    Balanced,
+    Thorough,
+}
+
+struct QualityDefaults {
+    top_k: usize,
+    threshold: f32,
+    diversity_threshold: f32,
+    provider: ProviderArg,
+}
+
+fn quality_defaults(quality: QualityArg) -> QualityDefaults {
+    match quality {
+        QualityArg::Fast => QualityDefaults {
+            top_k: 8,
+            threshold: 0.02,
+            diversity_threshold: 0.85,
+            provider: ProviderArg::Auto,
+        },
+        QualityArg::Balanced => QualityDefaults {
+            top_k: 10,
+            threshold: 0.01,
+            diversity_threshold: 0.8,
+            provider: ProviderArg::Auto,
+        },
+        QualityArg::Thorough => QualityDefaults {
+            top_k: 16,
+            threshold: 0.005,
+            diversity_threshold: 0.75,
+            provider: ProviderArg::Auto,
+        },
     }
 }
 
@@ -100,17 +167,24 @@ fn main() -> anyhow::Result<()> {
     });
 
     let cli = Cli::parse();
+    let preset = quality_defaults(cli.quality);
+    let top_k = cli.top_k.unwrap_or(preset.top_k);
+    let threshold = cli.threshold.unwrap_or(preset.threshold);
+    let diversity_threshold = cli
+        .diversity_threshold
+        .unwrap_or(preset.diversity_threshold);
+    let provider = cli.provider.unwrap_or(preset.provider);
 
-    if !(0.0..=1.0).contains(&cli.threshold) {
-        anyhow::bail!("--threshold must be in [0.0, 1.0], got {}", cli.threshold);
+    if !(0.0..=1.0).contains(&threshold) {
+        anyhow::bail!("--threshold must be in [0.0, 1.0], got {}", threshold);
     }
-    if !(0.0..=1.0).contains(&cli.diversity_threshold) {
+    if !(0.0..=1.0).contains(&diversity_threshold) {
         anyhow::bail!(
             "--diversity-threshold must be in [0.0, 1.0], got {}",
-            cli.diversity_threshold
+            diversity_threshold
         );
     }
-    if cli.top_k == 0 {
+    if top_k == 0 {
         anyhow::bail!("--top-k must be >= 1");
     }
 
@@ -125,9 +199,9 @@ fn main() -> anyhow::Result<()> {
             warmup,
             iterations,
             cli.model,
-            cli.provider,
+            provider,
             cli.vocab,
-            cli.diversity_threshold,
+            diversity_threshold,
         );
     }
 
@@ -143,15 +217,16 @@ fn main() -> anyhow::Result<()> {
         cli.write_metadata,
         cli.dry_run,
         cli.force,
+        cli.write_mode.into_write_mode(),
         cli.recursive,
         cli.model,
-        Some(cli.provider.as_str().to_string()),
+        Some(provider.as_str().to_string()),
         cli.vocab,
-        Some(cli.diversity_threshold),
+        Some(diversity_threshold),
     );
 
     let pipeline = Pipeline::from_model(config)?;
-    let result = pipeline.run_batch(&path, cli.top_k, cli.threshold);
+    let result = pipeline.run_batch(&path, top_k, threshold);
 
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&result)?);

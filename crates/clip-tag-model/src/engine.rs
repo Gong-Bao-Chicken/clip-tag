@@ -40,6 +40,9 @@ impl Default for ModelConfig {
 pub enum ExecutionProvider {
     Auto,
     Cpu,
+    Metal,
+    Coreml,
+    Directml,
 }
 
 impl ExecutionProvider {
@@ -47,8 +50,11 @@ impl ExecutionProvider {
         match raw.unwrap_or("auto") {
             "auto" => Ok(Self::Auto),
             "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            "coreml" => Ok(Self::Coreml),
+            "directml" => Ok(Self::Directml),
             other => Err(Error::Config(format!(
-                "unsupported provider `{other}`; expected one of: auto, cpu"
+                "unsupported provider `{other}`; expected one of: auto, cpu, metal, coreml, directml"
             ))),
         }
     }
@@ -177,6 +183,10 @@ fn select_diverse_top_k(
 
     let k = top_k.min(ranked.len());
     let mut selected: Vec<(usize, f32)> = Vec::with_capacity(k);
+    let row_norms: Vec<f32> = text_embeddings
+        .outer_iter()
+        .map(|row| row.dot(&row).sqrt())
+        .collect();
 
     for &(idx, score) in ranked {
         if selected.len() >= k {
@@ -184,8 +194,12 @@ fn select_diverse_top_k(
         }
 
         let is_too_similar = selected.iter().any(|&(selected_idx, _)| {
-            cosine_similarity(text_embeddings.row(idx), text_embeddings.row(selected_idx))
-                >= max_similarity
+            cosine_similarity_with_norms(
+                text_embeddings.row(idx),
+                row_norms[idx],
+                text_embeddings.row(selected_idx),
+                row_norms[selected_idx],
+            ) >= max_similarity
         });
         if !is_too_similar {
             selected.push((idx, score));
@@ -197,7 +211,10 @@ fn select_diverse_top_k(
             if selected.len() >= k {
                 break;
             }
-            if selected.iter().any(|&(selected_idx, _)| selected_idx == idx) {
+            if selected
+                .iter()
+                .any(|&(selected_idx, _)| selected_idx == idx)
+            {
                 continue;
             }
             selected.push((idx, score));
@@ -207,10 +224,13 @@ fn select_diverse_top_k(
     selected
 }
 
-fn cosine_similarity(a: ArrayView1<'_, f32>, b: ArrayView1<'_, f32>) -> f32 {
+fn cosine_similarity_with_norms(
+    a: ArrayView1<'_, f32>,
+    a_norm: f32,
+    b: ArrayView1<'_, f32>,
+    b_norm: f32,
+) -> f32 {
     let dot = a.dot(&b);
-    let a_norm = a.dot(&a).sqrt();
-    let b_norm = b.dot(&b).sqrt();
     if a_norm <= f32::EPSILON || b_norm <= f32::EPSILON {
         return 0.0;
     }
@@ -220,6 +240,24 @@ fn cosine_similarity(a: ArrayView1<'_, f32>, b: ArrayView1<'_, f32>) -> f32 {
 async fn load_clip_with_provider(model_id: &str, provider: ExecutionProvider) -> Result<Clip> {
     match provider {
         ExecutionProvider::Cpu | ExecutionProvider::Auto => {
+            load_clip(model_id, &cpu_execution_providers()).await
+        }
+        ExecutionProvider::Metal => {
+            tracing::warn!(
+                "provider `metal` requested but not yet implemented; falling back to CPU"
+            );
+            load_clip(model_id, &cpu_execution_providers()).await
+        }
+        ExecutionProvider::Coreml => {
+            tracing::warn!(
+                "provider `coreml` requested but not yet implemented; falling back to CPU"
+            );
+            load_clip(model_id, &cpu_execution_providers()).await
+        }
+        ExecutionProvider::Directml => {
+            tracing::warn!(
+                "provider `directml` requested but not yet implemented; falling back to CPU"
+            );
             load_clip(model_id, &cpu_execution_providers()).await
         }
     }
@@ -338,6 +376,8 @@ fn ensure_optional_sidecars(model_dir: &Path) -> Result<()> {
     for file in OPTIONAL_DATA_SIDECARS {
         let sidecar = model_dir.join(file);
         if !sidecar.exists() {
+            // Some ONNX runtimes/producers expect a .onnx.data companion path even when
+            // weights are embedded; create an empty file as a compatibility workaround.
             std::fs::write(&sidecar, []).map_err(|e| {
                 Error::Load(format!(
                     "failed creating compatibility sidecar `{}`: {e}",
@@ -369,7 +409,10 @@ fn normalize_model_config(model_dir: &Path) -> Result<()> {
         if let Some(pad_id) = json
             .pointer("/pad_token_id")
             .and_then(|v| v.as_u64())
-            .or_else(|| json.pointer("/text_config/pad_token_id").and_then(|v| v.as_u64()))
+            .or_else(|| {
+                json.pointer("/text_config/pad_token_id")
+                    .and_then(|v| v.as_u64())
+            })
         {
             json["pad_id"] = serde_json::Value::from(pad_id);
             changed = true;
@@ -391,8 +434,9 @@ fn normalize_model_config(model_dir: &Path) -> Result<()> {
         if let Ok(tokenizer_config) = std::fs::read_to_string(&tokenizer_config_path) {
             if let Ok(tokenizer_json) = serde_json::from_str::<serde_json::Value>(&tokenizer_config)
             {
-                if let Some(do_lower_case) =
-                    tokenizer_json.get("do_lower_case").and_then(|v| v.as_bool())
+                if let Some(do_lower_case) = tokenizer_json
+                    .get("do_lower_case")
+                    .and_then(|v| v.as_bool())
                 {
                     json["tokenizer_needs_lowercase"] = serde_json::Value::from(do_lower_case);
                     changed = true;
@@ -444,6 +488,18 @@ mod tests {
             ExecutionProvider::parse(Some("cpu")).unwrap(),
             ExecutionProvider::Cpu
         );
+        assert_eq!(
+            ExecutionProvider::parse(Some("metal")).unwrap(),
+            ExecutionProvider::Metal
+        );
+        assert_eq!(
+            ExecutionProvider::parse(Some("coreml")).unwrap(),
+            ExecutionProvider::Coreml
+        );
+        assert_eq!(
+            ExecutionProvider::parse(Some("directml")).unwrap(),
+            ExecutionProvider::Directml
+        );
     }
 
     #[test]
@@ -479,9 +535,10 @@ mod tests {
         .unwrap();
 
         normalize_model_config(model_dir).unwrap();
-        let normalized: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(model_dir.join("model_config.json")).unwrap())
-                .unwrap();
+        let normalized: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(model_dir.join("model_config.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(normalized.get("pad_id").and_then(|v| v.as_u64()), Some(1));
         assert_eq!(
             normalized
@@ -521,10 +578,20 @@ mod tests {
     #[test]
     fn select_diverse_top_k_falls_back_to_fill_requested_k() {
         let ranked = vec![(0, 0.90), (1, 0.89), (2, 0.88)];
+        let embeddings = array![[1.0, 0.0], [0.9999, 0.0001], [0.9998, 0.0002]];
+
+        let out = select_diverse_top_k(&ranked, &embeddings, 2, 0.95);
+
+        assert_eq!(out, vec![(0, 0.90), (1, 0.89)]);
+    }
+
+    #[test]
+    fn select_diverse_top_k_handles_zero_norm_rows() {
+        let ranked = vec![(0, 0.90), (1, 0.89), (2, 0.88)];
         let embeddings = array![
-            [1.0, 0.0],
-            [0.9999, 0.0001],
-            [0.9998, 0.0002]
+            [0.0, 0.0], // zero vector should produce 0 cosine similarity
+            [0.0, 0.0],
+            [1.0, 0.0]
         ];
 
         let out = select_diverse_top_k(&ranked, &embeddings, 2, 0.95);

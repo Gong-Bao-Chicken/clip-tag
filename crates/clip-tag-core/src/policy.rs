@@ -10,6 +10,8 @@ pub enum WriteMode {
     /// Add tags only when all target keyword fields are empty.
     #[default]
     EmptyOnly,
+    /// Merge proposed tags with existing tags, then rewrite the canonical set.
+    Merge,
     /// Overwrite existing keyword values when `--force` is set.
     ForceOverwrite,
 }
@@ -32,6 +34,12 @@ pub enum WriteDecision {
 
 pub fn plan_write(input: WritePolicyInput) -> Result<WriteDecision> {
     let tags = crate::normalize::normalize_tags(input.proposed_tags);
+    let existing = crate::normalize::normalize_tags(
+        MetadataField::all()
+            .iter()
+            .flat_map(|field| input.current.get(*field).unwrap_or(&[]).iter().cloned())
+            .collect::<Vec<String>>(),
+    );
 
     if tags.is_empty() {
         return Ok(WriteDecision::Skip {
@@ -43,6 +51,26 @@ pub fn plan_write(input: WritePolicyInput) -> Result<WriteDecision> {
     let any_nonempty = fields.iter().any(|f| input.current.get(*f).is_some());
 
     let allow_overwrite = input.force || input.mode == WriteMode::ForceOverwrite;
+    let is_merge = input.mode == WriteMode::Merge && !input.force;
+
+    if is_merge {
+        let mut merged = existing;
+        for tag in tags {
+            if !merged.contains(&tag) {
+                merged.push(tag);
+            }
+        }
+        if merged.is_empty() {
+            return Ok(WriteDecision::Skip {
+                reason: "no tags after merge".into(),
+            });
+        }
+        return Ok(WriteDecision::Apply(WritePlan {
+            tags: merged,
+            fields: fields.to_vec(),
+            overwrite: true,
+        }));
+    }
 
     if any_nonempty && !allow_overwrite {
         return Ok(WriteDecision::Skip {
@@ -110,6 +138,28 @@ mod tests {
 
         match decision {
             WriteDecision::Apply(plan) => assert!(plan.overwrite),
+            _ => panic!("expected apply"),
+        }
+    }
+
+    #[test]
+    fn merge_mode_combines_existing_and_new_tags() {
+        let mut current = FieldSnapshot::default();
+        current.set(MetadataField::XmpSubject, vec!["beach".into()]);
+
+        let decision = plan_write(WritePolicyInput {
+            mode: WriteMode::Merge,
+            force: false,
+            proposed_tags: vec!["sunset".into(), "beach".into()],
+            current,
+        })
+        .unwrap();
+
+        match decision {
+            WriteDecision::Apply(plan) => {
+                assert_eq!(plan.tags, vec!["beach".to_string(), "sunset".to_string()]);
+                assert!(plan.overwrite);
+            }
             _ => panic!("expected apply"),
         }
     }
