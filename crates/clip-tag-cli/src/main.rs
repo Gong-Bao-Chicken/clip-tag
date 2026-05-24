@@ -67,6 +67,10 @@ struct Cli {
     /// Max cosine similarity allowed between selected tags (lower = more diverse).
     #[arg(long)]
     diversity_threshold: Option<f32>,
+
+    /// Images per ORT vision call. `1` disables batching.
+    #[arg(long)]
+    batch_size: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -88,6 +92,7 @@ enum ProviderArg {
     Metal,
     Coreml,
     Directml,
+    Cuda,
 }
 
 impl ProviderArg {
@@ -98,6 +103,7 @@ impl ProviderArg {
             Self::Metal => "metal",
             Self::Coreml => "coreml",
             Self::Directml => "directml",
+            Self::Cuda => "cuda",
         }
     }
 }
@@ -129,6 +135,7 @@ struct QualityDefaults {
     threshold: f32,
     diversity_threshold: f32,
     provider: ProviderArg,
+    batch_size: usize,
 }
 
 fn quality_defaults(quality: QualityArg) -> QualityDefaults {
@@ -138,19 +145,33 @@ fn quality_defaults(quality: QualityArg) -> QualityDefaults {
             threshold: 0.02,
             diversity_threshold: 0.85,
             provider: ProviderArg::Auto,
+            batch_size: 16,
         },
         QualityArg::Balanced => QualityDefaults {
             top_k: 10,
             threshold: 0.01,
             diversity_threshold: 0.8,
             provider: ProviderArg::Auto,
+            batch_size: 8,
         },
         QualityArg::Thorough => QualityDefaults {
             top_k: 16,
             threshold: 0.005,
             diversity_threshold: 0.75,
             provider: ProviderArg::Auto,
+            batch_size: 4,
         },
+    }
+}
+
+fn provider_to_execution_provider(p: ProviderArg) -> clip_tag_model::ExecutionProvider {
+    match p {
+        ProviderArg::Auto => clip_tag_model::ExecutionProvider::Auto,
+        ProviderArg::Cpu => clip_tag_model::ExecutionProvider::Cpu,
+        ProviderArg::Metal => clip_tag_model::ExecutionProvider::Metal,
+        ProviderArg::Coreml => clip_tag_model::ExecutionProvider::Coreml,
+        ProviderArg::Directml => clip_tag_model::ExecutionProvider::Directml,
+        ProviderArg::Cuda => clip_tag_model::ExecutionProvider::Cuda,
     }
 }
 
@@ -178,6 +199,15 @@ fn main() -> anyhow::Result<()> {
         .diversity_threshold
         .unwrap_or(preset.diversity_threshold);
     let provider = cli.provider.unwrap_or(preset.provider);
+    let batch_size = cli.batch_size.unwrap_or(preset.batch_size).max(1);
+
+    // When the user didn't pick a model, fall back to the recommended one for
+    // the chosen provider. Predefined per-provider — see
+    // `clip_tag_model::recommended_model_for`.
+    let model_id = cli.model.clone().or_else(|| {
+        let rec = clip_tag_model::recommended_model_for(provider_to_execution_provider(provider));
+        Some(rec.model_id.to_string())
+    });
 
     if !(0.0..=1.0).contains(&threshold) {
         anyhow::bail!("--threshold must be in [0.0, 1.0], got {}", threshold);
@@ -191,6 +221,9 @@ fn main() -> anyhow::Result<()> {
     if top_k == 0 {
         anyhow::bail!("--top-k must be >= 1");
     }
+    if batch_size == 0 {
+        anyhow::bail!("--batch-size must be >= 1");
+    }
 
     if let Some(Commands::Benchmark {
         path,
@@ -202,7 +235,7 @@ fn main() -> anyhow::Result<()> {
             &path,
             warmup,
             iterations,
-            cli.model,
+            model_id,
             provider,
             cli.vocab,
             diversity_threshold,
@@ -223,10 +256,11 @@ fn main() -> anyhow::Result<()> {
         cli.force,
         cli.write_mode.into_write_mode(),
         cli.recursive,
-        cli.model,
+        model_id,
         Some(provider.as_str().to_string()),
         cli.vocab,
         Some(diversity_threshold),
+        batch_size,
     );
 
     let pipeline = Pipeline::from_model(config)?;

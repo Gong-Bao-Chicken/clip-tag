@@ -49,6 +49,7 @@ pub enum ExecutionProvider {
     Metal,
     Coreml,
     Directml,
+    Cuda,
 }
 
 impl ExecutionProvider {
@@ -59,8 +60,9 @@ impl ExecutionProvider {
             "metal" => Ok(Self::Metal),
             "coreml" => Ok(Self::Coreml),
             "directml" => Ok(Self::Directml),
+            "cuda" => Ok(Self::Cuda),
             other => Err(Error::Config(format!(
-                "unsupported provider `{other}`; expected one of: auto, cpu, metal, coreml, directml"
+                "unsupported provider `{other}`; expected one of: auto, cpu, metal, coreml, directml, cuda"
             ))),
         }
     }
@@ -144,37 +146,67 @@ impl TaggingEngine {
     }
 
     fn tag_dynamic(&self, image: &DynamicImage, top_k: usize) -> Result<Vec<TagScore>> {
-        let img_emb = self
+        let mut batch = self.tag_batch(std::slice::from_ref(image), top_k)?;
+        Ok(batch.pop().unwrap_or_default())
+    }
+
+    /// Score a batch of images against the vocabulary in a single ORT call.
+    ///
+    /// The ORT session uses a write-lock (`RwLock::write`) internally; batching
+    /// is the only way to amortize that lock and the per-call dispatch overhead
+    /// — without it, parallel `tag_path` calls serialize at the session.
+    ///
+    /// Returns one ranked `Vec<TagScore>` per input image, in input order. An
+    /// empty `images` slice returns an empty vec without touching the model.
+    pub fn tag_batch(
+        &self,
+        images: &[DynamicImage],
+        top_k: usize,
+    ) -> Result<Vec<Vec<TagScore>>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut image_embs = self
             .clip
             .vision
-            .embed_image(image)
+            .embed_images(images)
             .map_err(|e| Error::Inference(e.to_string()))?;
 
-        let similarities = self.text_embeddings.dot(&img_emb);
+        // Normalize image embeddings so the matrix multiply below is cosine
+        // similarity (text embeddings were already normalized at load).
+        l2_normalize_rows(&mut image_embs);
+
         let scale = self.clip.text.model_config.logit_scale.unwrap_or(1.0);
         let bias = self.clip.text.model_config.logit_bias.unwrap_or(0.0);
 
-        let logits: Vec<f32> = similarities
-            .iter()
-            .map(|&s| s.mul_add(scale, bias))
-            .collect();
-        let probs = Clip::softmax(&logits);
+        // Shape: (vocab, batch). One column per image.
+        let similarities = self.text_embeddings.dot(&image_embs.t());
 
-        let ranked = partial_rank(&probs, top_k);
-
-        let selected = select_diverse_top_k(
-            &ranked,
-            &self.text_embeddings,
-            top_k,
-            self.diversity_threshold,
-        );
-        Ok(selected
-            .into_iter()
-            .map(|(idx, score)| TagScore {
-                label: self.labels[idx].clone(),
-                score,
-            })
-            .collect())
+        let n = images.len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let col = similarities.column(i);
+            let logits: Vec<f32> = col.iter().map(|&s| s.mul_add(scale, bias)).collect();
+            let probs = Clip::softmax(&logits);
+            let ranked = partial_rank(&probs, top_k);
+            let selected = select_diverse_top_k(
+                &ranked,
+                &self.text_embeddings,
+                top_k,
+                self.diversity_threshold,
+            );
+            out.push(
+                selected
+                    .into_iter()
+                    .map(|(idx, score)| TagScore {
+                        label: self.labels[idx].clone(),
+                        score,
+                    })
+                    .collect(),
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -268,29 +300,113 @@ fn partial_rank(probs: &[f32], top_k: usize) -> Vec<(usize, f32)> {
 }
 
 async fn load_clip_with_provider(model_id: &str, provider: ExecutionProvider) -> Result<Clip> {
-    match provider {
-        ExecutionProvider::Cpu | ExecutionProvider::Auto => {
-            load_clip(model_id, &cpu_execution_providers()).await
-        }
+    let providers = build_execution_providers(provider)?;
+    load_clip(model_id, &providers).await
+}
+
+/// Build the execution-provider chain for a requested provider.
+///
+/// Accelerator providers are stacked first with `fail_silently` (the default),
+/// so ORT routes unsupported ops down to the CPU provider that always tails
+/// the chain. `error_on_failure()` is applied to the CPU tail so a true
+/// catastrophe (no EP registered at all) surfaces as a proper error.
+fn build_execution_providers(
+    provider: ExecutionProvider,
+) -> Result<Vec<ExecutionProviderDispatch>> {
+    let chain = match provider {
+        ExecutionProvider::Cpu => cpu_execution_providers(),
+        ExecutionProvider::Auto => auto_providers_for_target(),
+        ExecutionProvider::Coreml => coreml_chain()?,
+        ExecutionProvider::Directml => directml_chain()?,
+        ExecutionProvider::Cuda => cuda_chain()?,
         ExecutionProvider::Metal => {
-            tracing::warn!(
-                "provider `metal` requested but not yet implemented; falling back to CPU"
-            );
-            load_clip(model_id, &cpu_execution_providers()).await
+            // `metal` is reserved for future use; on macOS today CoreML routes
+            // to ANE/GPU including Metal kernels, so we treat it as an alias
+            // and let it fall through the same chain.
+            #[cfg(feature = "coreml")]
+            {
+                coreml_chain()?
+            }
+            #[cfg(not(feature = "coreml"))]
+            {
+                tracing::warn!(
+                    "provider `metal` requires the `coreml` build feature; using CPU"
+                );
+                cpu_execution_providers()
+            }
         }
-        ExecutionProvider::Coreml => {
-            tracing::warn!(
-                "provider `coreml` requested but not yet implemented; falling back to CPU"
-            );
-            load_clip(model_id, &cpu_execution_providers()).await
-        }
-        ExecutionProvider::Directml => {
-            tracing::warn!(
-                "provider `directml` requested but not yet implemented; falling back to CPU"
-            );
-            load_clip(model_id, &cpu_execution_providers()).await
-        }
+    };
+    Ok(chain)
+}
+
+fn auto_providers_for_target() -> Vec<ExecutionProviderDispatch> {
+    let mut chain: Vec<ExecutionProviderDispatch> = Vec::new();
+
+    #[cfg(all(feature = "coreml", target_os = "macos"))]
+    {
+        chain.push(
+            ort::ep::CoreML::default()
+                .with_compute_units(ort::ep::coreml::ComputeUnits::All)
+                .build(),
+        );
     }
+
+    #[cfg(all(feature = "directml", target_os = "windows"))]
+    {
+        chain.push(ort::ep::DirectML::default().build());
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        chain.push(ort::ep::CUDA::default().build());
+    }
+
+    chain.push(CPU::default().build().error_on_failure());
+    chain
+}
+
+fn coreml_chain() -> Result<Vec<ExecutionProviderDispatch>> {
+    #[cfg(feature = "coreml")]
+    {
+        Ok(vec![
+            ort::ep::CoreML::default()
+                .with_compute_units(ort::ep::coreml::ComputeUnits::All)
+                .build(),
+            CPU::default().build().error_on_failure(),
+        ])
+    }
+    #[cfg(not(feature = "coreml"))]
+    Err(Error::Config(
+        "provider `coreml` requires building with --features coreml".into(),
+    ))
+}
+
+fn directml_chain() -> Result<Vec<ExecutionProviderDispatch>> {
+    #[cfg(feature = "directml")]
+    {
+        Ok(vec![
+            ort::ep::DirectML::default().build(),
+            CPU::default().build().error_on_failure(),
+        ])
+    }
+    #[cfg(not(feature = "directml"))]
+    Err(Error::Config(
+        "provider `directml` requires building with --features directml".into(),
+    ))
+}
+
+fn cuda_chain() -> Result<Vec<ExecutionProviderDispatch>> {
+    #[cfg(feature = "cuda")]
+    {
+        Ok(vec![
+            ort::ep::CUDA::default().build(),
+            CPU::default().build().error_on_failure(),
+        ])
+    }
+    #[cfg(not(feature = "cuda"))]
+    Err(Error::Config(
+        "provider `cuda` requires building with --features cuda".into(),
+    ))
 }
 
 async fn load_clip(model_id: &str, providers: &[ExecutionProviderDispatch]) -> Result<Clip> {
@@ -492,6 +608,40 @@ fn cpu_execution_providers() -> Vec<ExecutionProviderDispatch> {
     vec![CPU::default().build().error_on_failure()]
 }
 
+/// Recommended default model for a given execution provider.
+///
+/// Used by the CLI when the user picks a provider but does not pass `--model`.
+/// Every variant returns a model id so callers can rely on a non-empty default
+/// even when the feature for that provider isn't compiled in (the chain just
+/// won't build, but the caller still has a sensible reference model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecommendedModel {
+    pub model_id: &'static str,
+    /// Human-readable note for documentation and `--help` style listings.
+    pub notes: &'static str,
+}
+
+pub fn recommended_model_for(provider: ExecutionProvider) -> RecommendedModel {
+    match provider {
+        ExecutionProvider::Cpu | ExecutionProvider::Auto => RecommendedModel {
+            model_id: DEFAULT_MODEL_ID,
+            notes: "MobileCLIP2-S3: balanced CPU baseline",
+        },
+        ExecutionProvider::Coreml | ExecutionProvider::Metal => RecommendedModel {
+            model_id: "RuteNL/MobileCLIP2-S3-OpenCLIP-ONNX",
+            notes: "MobileCLIP2-S3: well-supported on Apple Silicon ANE / GPU",
+        },
+        ExecutionProvider::Directml => RecommendedModel {
+            model_id: "RuteNL/MobileCLIP2-S3-OpenCLIP-ONNX",
+            notes: "MobileCLIP2-S3: portable across Windows DirectML GPUs",
+        },
+        ExecutionProvider::Cuda => RecommendedModel {
+            model_id: "RuteNL/MobileCLIP2-S4-OpenCLIP-ONNX",
+            notes: "MobileCLIP2-S4: heavier sibling, runs well on CUDA GPUs",
+        },
+    }
+}
+
 pub type SharedEngine = Arc<TaggingEngine>;
 
 pub fn load_shared(config: ModelConfig) -> Result<SharedEngine> {
@@ -648,6 +798,49 @@ mod tests {
         let ranked = partial_rank(&probs, 2);
         assert_eq!(ranked[0].0, 0);
         assert_eq!(ranked[1].0, 1);
+    }
+
+    #[test]
+    fn every_provider_has_a_recommended_model() {
+        // Failing this test means a new ExecutionProvider variant was added
+        // without a recommended_model_for arm — fix the registry before
+        // landing the new variant.
+        for provider in [
+            ExecutionProvider::Auto,
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Coreml,
+            ExecutionProvider::Directml,
+            ExecutionProvider::Cuda,
+        ] {
+            let rec = recommended_model_for(provider);
+            assert!(
+                !rec.model_id.is_empty(),
+                "provider {provider:?} has empty model id"
+            );
+            assert!(
+                rec.model_id.contains('/'),
+                "provider {provider:?} model id should be a HF repo id, got {:?}",
+                rec.model_id
+            );
+            assert!(
+                !rec.notes.is_empty(),
+                "provider {provider:?} has empty notes"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_and_auto_default_to_workspace_default_model() {
+        // Auto/CPU should be the predictable, well-tested baseline.
+        assert_eq!(
+            recommended_model_for(ExecutionProvider::Auto).model_id,
+            DEFAULT_MODEL_ID,
+        );
+        assert_eq!(
+            recommended_model_for(ExecutionProvider::Cpu).model_id,
+            DEFAULT_MODEL_ID,
+        );
     }
 
     #[test]

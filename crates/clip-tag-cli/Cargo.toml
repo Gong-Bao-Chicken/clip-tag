@@ -21,6 +21,12 @@ clip-tag-core.workspace = true
 clip-tag-metadata.workspace = true
 clip-tag-model.workspace = true
 
+[features]
+default = []
+coreml = ["clip-tag-model/coreml"]
+directml = ["clip-tag-model/directml"]
+cuda = ["clip-tag-model/cuda"]
+
 [dev-dependencies]
 assert_cmd = "2"
 image = { workspace = true, features = ["jpeg", "png", "tiff"] }
