@@ -413,6 +413,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "clip-tag-core",
+ "clip-tag-image",
  "clip-tag-metadata",
  "clip-tag-model",
  "image",

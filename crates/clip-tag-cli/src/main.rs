@@ -261,6 +261,7 @@ fn main() -> anyhow::Result<()> {
             provider,
             cli.vocab,
             diversity_threshold,
+            batch_size,
         );
     }
 
@@ -422,6 +423,7 @@ fn run_benchmark(
     provider: ProviderArg,
     vocab: Option<PathBuf>,
     diversity_threshold: f32,
+    batch_size: usize,
 ) -> anyhow::Result<()> {
     use clip_tag_model::{load_shared, ExecutionProvider, ModelConfig};
     use std::time::Instant;
@@ -434,47 +436,80 @@ fn run_benchmark(
     };
     let engine = load_shared(config)?;
 
-    let sample = select_benchmark_sample(path)?;
+    let (sources, batch) = build_benchmark_batch(path, batch_size)?;
 
+    // Warmup also primes any first-call CoreML / DirectML graph compilation.
     for _ in 0..warmup {
-        let _ = engine.tag_path(&sample, 10)?;
+        let _ = engine.tag_batch(&batch, 10)?;
     }
 
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = engine.tag_path(&sample, 10)?;
+        let _ = engine.tag_batch(&batch, 10)?;
     }
     let elapsed = start.elapsed();
 
-    let per_image_ms = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
-    let ips = iterations as f64 / elapsed.as_secs_f64();
+    let total_images = iterations * batch.len();
+    let total_seconds = elapsed.as_secs_f64();
+    let per_batch_ms = total_seconds * 1000.0 / iterations as f64;
+    let per_image_ms = total_seconds * 1000.0 / total_images as f64;
+    let ips = total_images as f64 / total_seconds;
 
-    println!("benchmark sample: {}", sample.display());
+    println!(
+        "benchmark: provider={} batch_size={} (decoded {} unique image{})",
+        provider.as_str(),
+        batch.len(),
+        sources.len(),
+        if sources.len() == 1 { "" } else { "s" },
+    );
     println!("iterations: {iterations} (warmup {warmup})");
-    println!("total: {:.3}s", elapsed.as_secs_f64());
-    println!("latency: {per_image_ms:.2} ms/image");
+    println!("total: {total_seconds:.3}s ({total_images} images scored)");
+    println!("per-batch latency: {per_batch_ms:.2} ms");
+    println!("per-image latency: {per_image_ms:.2} ms (decode excluded)");
     println!("throughput: {ips:.2} images/sec");
     Ok(())
 }
 
-fn select_benchmark_sample(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    if path.is_file() {
-        return Ok(path.to_path_buf());
+/// Build the benchmark batch by walking the corpus and pre-decoding
+/// `batch_size` images. Decoding happens outside the timed loop so the
+/// benchmark measures steady-state inference rather than I/O. When the
+/// corpus has fewer images than `batch_size`, paths cycle.
+fn build_benchmark_batch(
+    path: &std::path::Path,
+    batch_size: usize,
+) -> anyhow::Result<(Vec<std::path::PathBuf>, Vec<image::DynamicImage>)> {
+    let sources: Vec<std::path::PathBuf> = if path.is_file() {
+        vec![path.to_path_buf()]
+    } else {
+        let discovered = Pipeline::discover_paths(path, true)
+            .map_err(|e| anyhow::anyhow!("discover_paths: {e}"))?;
+        if discovered.is_empty() {
+            anyhow::bail!("no supported images found under {}", path.display());
+        }
+        discovered
+    };
+
+    let mut images = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        let src = &sources[i % sources.len()];
+        let img = clip_tag_image::load_dynamic_for_inference(
+            src,
+            clip_tag_image::DEFAULT_MAX_INFERENCE_DIM,
+        )
+        .map_err(|e| anyhow::anyhow!("decode {}: {e}", src.display()))?;
+        images.push(img);
     }
-    Pipeline::discover_paths(path, true)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no supported images found under {}", path.display()))
+    Ok((sources, images))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::select_benchmark_sample;
+    use super::build_benchmark_batch;
     use image::{ImageBuffer, Rgb};
     use tempfile::tempdir;
 
     #[test]
-    fn benchmark_sample_selects_supported_non_jpg() {
+    fn benchmark_batch_walks_corpus_and_decodes() {
         let dir = tempdir().unwrap();
         let png_path = dir.path().join("sample.PNG");
         let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(8, 8, |x, y| {
@@ -482,7 +517,21 @@ mod tests {
         });
         img.save(&png_path).unwrap();
 
-        let selected = select_benchmark_sample(dir.path()).unwrap();
-        assert_eq!(selected, png_path);
+        let (sources, images) = build_benchmark_batch(dir.path(), 4).unwrap();
+        assert_eq!(sources, vec![png_path]);
+        assert_eq!(images.len(), 4, "batch cycles through the single source");
+    }
+
+    #[test]
+    fn benchmark_batch_accepts_single_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("only.png");
+        ImageBuffer::from_pixel(8, 8, Rgb([1u8, 2, 3]))
+            .save(&path)
+            .unwrap();
+
+        let (sources, images) = build_benchmark_batch(&path, 1).unwrap();
+        assert_eq!(sources, vec![path]);
+        assert_eq!(images.len(), 1);
     }
 }
