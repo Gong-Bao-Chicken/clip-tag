@@ -44,11 +44,23 @@ pub struct ModelConfig {
     pub diversity_threshold: Option<f32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BatchConfig {
     pub recursive: bool,
     pub continue_on_error: bool,
+    /// Number of images per ORT vision call. `1` disables batching.
+    pub batch_size: usize,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            recursive: false,
+            continue_on_error: false,
+            batch_size: 1,
+        }
+    }
 }
 
 impl Config {
