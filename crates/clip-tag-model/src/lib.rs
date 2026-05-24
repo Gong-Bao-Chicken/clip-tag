@@ -1,5 +1,6 @@
 //! Local ONNX CLIP session and vocabulary scoring.
 
+pub mod cache;
 pub mod engine;
 pub mod error;
 pub mod external_data;

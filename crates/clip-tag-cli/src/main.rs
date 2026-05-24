@@ -83,6 +83,23 @@ enum Commands {
         #[arg(long, default_value = "20")]
         iterations: usize,
     },
+    /// Inspect or reclaim clip-tag's on-disk caches.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheAction {
+    /// Show cache sizes without deleting anything.
+    Info,
+    /// Delete cached folded models and vocabulary embeddings.
+    Prune {
+        /// Show what would be deleted without actually deleting.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -191,6 +208,11 @@ fn main() -> anyhow::Result<()> {
             execute_plan(p, plan, dry).map_err(|e| clip_tag_core::Error::Metadata(e.to_string()))
         },
     });
+
+    // Cache subcommands stand alone — no model load, no path, no validation.
+    if let Some(Commands::Cache { action }) = &cli.command {
+        return run_cache_command(action);
+    }
 
     let preset = quality_defaults(cli.quality);
     let top_k = cli.top_k.unwrap_or(preset.top_k);
@@ -317,6 +339,78 @@ fn print_text(result: &clip_tag_core::BatchResult) {
             let Some(write) = &file.write else { continue };
             println!("{}: metadata: {}", file.path, write.decision);
         }
+    }
+}
+
+fn run_cache_command(action: &CacheAction) -> anyhow::Result<()> {
+    use clip_tag_model::cache;
+
+    match action {
+        CacheAction::Info => {
+            let summary = cache::summary();
+            print_cache_summary(&summary);
+        }
+        CacheAction::Prune { dry_run } => {
+            let report = cache::prune(*dry_run)?;
+            print_prune_report(&report);
+        }
+    }
+    Ok(())
+}
+
+fn print_cache_summary(s: &clip_tag_model::cache::CacheSummary) {
+    println!(
+        "cache root: {}",
+        s.root
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unavailable)".into())
+    );
+    print_cache_entry("folded-models", &s.folded_models, "model");
+    print_cache_entry("vocab-cache  ", &s.vocab_cache, "entry");
+    println!("total:          {}", format_bytes(s.total_bytes()));
+}
+
+fn print_prune_report(r: &clip_tag_model::cache::PruneReport) {
+    if r.total_bytes() == 0 {
+        println!("clip-tag cache is empty — nothing to prune.");
+        return;
+    }
+    let verb = if r.dry_run { "would free" } else { "freed" };
+    print_cache_entry("folded-models", &r.folded_models, "model");
+    print_cache_entry("vocab-cache  ", &r.vocab_cache, "entry");
+    println!("{verb}: {}", format_bytes(r.total_bytes()));
+    if r.dry_run {
+        println!("(dry run — re-run without --dry-run to delete)");
+    }
+}
+
+fn print_cache_entry(label: &str, e: &clip_tag_model::cache::CacheEntry, item_noun: &str) {
+    let suffix = if e.items == 1 {
+        item_noun.to_string()
+    } else {
+        format!("{item_noun}s")
+    };
+    println!(
+        "  {label}  {size:>10}  ({items} {suffix})",
+        size = format_bytes(e.bytes),
+        items = e.items,
+    );
+}
+
+fn format_bytes(b: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = b as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB", b / KB)
+    } else {
+        format!("{} B", b as u64)
     }
 }
 
