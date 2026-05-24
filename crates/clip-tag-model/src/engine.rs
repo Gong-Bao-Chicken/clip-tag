@@ -11,6 +11,12 @@ use crate::vocab;
 use crate::vocab_cache;
 use crate::{Error, Result, DEFAULT_MODEL_ID};
 
+/// Soft cap to keep top-K extraction near linear when the vocabulary grows.
+/// We partial-sort this many top-scoring labels, then full-sort just those for
+/// the diversity selector to walk through.
+const RANKING_CANDIDATE_LIMIT_PER_TOP_K: usize = 8;
+const MIN_RANKING_CANDIDATES: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TagScore {
     pub label: String,
@@ -95,7 +101,7 @@ impl TaggingEngine {
         tracing::info!(count = labels.len(), path = %vocab_path.display(), "loaded vocabulary");
 
         let cache_path = vocab_cache::cache_path_for(&vocab_path, model_id);
-        let text_embeddings = if cache_path.is_file() {
+        let mut text_embeddings = if cache_path.is_file() {
             tracing::info!(path = %cache_path.display(), "loading vocab embedding cache");
             match vocab_cache::load_cache(&cache_path, labels.len()) {
                 Ok(cached) => cached,
@@ -113,6 +119,8 @@ impl TaggingEngine {
             embs
         };
 
+        l2_normalize_rows(&mut text_embeddings);
+
         Ok(Self {
             clip,
             labels,
@@ -127,7 +135,11 @@ impl TaggingEngine {
     }
 
     pub fn tag_path(&self, path: &Path, top_k: usize) -> Result<Vec<TagScore>> {
-        let rgb = clip_tag_image::load_rgb8(path).map_err(|e| Error::Inference(e.to_string()))?;
+        let rgb = clip_tag_image::load_rgb8_for_inference(
+            path,
+            clip_tag_image::DEFAULT_MAX_INFERENCE_DIM,
+        )
+        .map_err(|e| Error::Inference(e.to_string()))?;
         self.tag_rgb8(&rgb, top_k)
     }
 
@@ -148,12 +160,7 @@ impl TaggingEngine {
             .collect();
         let probs = Clip::softmax(&logits);
 
-        let mut ranked: Vec<(usize, f32)> = probs.into_iter().enumerate().collect();
-        ranked.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        let ranked = partial_rank(&probs, top_k);
 
         let selected = select_diverse_top_k(
             &ranked,
@@ -183,23 +190,14 @@ fn select_diverse_top_k(
 
     let k = top_k.min(ranked.len());
     let mut selected: Vec<(usize, f32)> = Vec::with_capacity(k);
-    let row_norms: Vec<f32> = text_embeddings
-        .outer_iter()
-        .map(|row| row.dot(&row).sqrt())
-        .collect();
 
     for &(idx, score) in ranked {
         if selected.len() >= k {
             break;
         }
-
         let is_too_similar = selected.iter().any(|&(selected_idx, _)| {
-            cosine_similarity_with_norms(
-                text_embeddings.row(idx),
-                row_norms[idx],
-                text_embeddings.row(selected_idx),
-                row_norms[selected_idx],
-            ) >= max_similarity
+            cosine_of_unit_rows(text_embeddings.row(idx), text_embeddings.row(selected_idx))
+                >= max_similarity
         });
         if !is_too_similar {
             selected.push((idx, score));
@@ -224,17 +222,49 @@ fn select_diverse_top_k(
     selected
 }
 
-fn cosine_similarity_with_norms(
-    a: ArrayView1<'_, f32>,
-    a_norm: f32,
-    b: ArrayView1<'_, f32>,
-    b_norm: f32,
-) -> f32 {
-    let dot = a.dot(&b);
-    if a_norm <= f32::EPSILON || b_norm <= f32::EPSILON {
-        return 0.0;
+/// Cosine similarity for rows that were already L2-normalized at load time.
+/// Zero-norm rows (a degenerate vocab embedding) produce a clamped 0.
+fn cosine_of_unit_rows(a: ArrayView1<'_, f32>, b: ArrayView1<'_, f32>) -> f32 {
+    a.dot(&b).clamp(-1.0, 1.0)
+}
+
+fn l2_normalize_rows(matrix: &mut Array2<f32>) {
+    for mut row in matrix.outer_iter_mut() {
+        let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > f32::EPSILON {
+            row.mapv_inplace(|v| v / norm);
+        }
     }
-    (dot / (a_norm * b_norm)).clamp(-1.0, 1.0)
+}
+
+/// Return the top `select_diverse_top_k` candidate window as `(idx, score)`
+/// pairs sorted by score descending (then index ascending for determinism).
+///
+/// Uses [`select_nth_unstable_by`] so the heavy sort only touches the small
+/// candidate window even when the vocabulary is thousands of labels wide.
+fn partial_rank(probs: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+    let n = probs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let limit = top_k
+        .saturating_mul(RANKING_CANDIDATE_LIMIT_PER_TOP_K)
+        .max(MIN_RANKING_CANDIDATES)
+        .min(n);
+
+    let cmp = |a: &(usize, f32), b: &(usize, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    };
+
+    let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+    if limit < n {
+        indexed.select_nth_unstable_by(limit - 1, cmp);
+        indexed.truncate(limit);
+    }
+    indexed.sort_by(cmp);
+    indexed
 }
 
 async fn load_clip_with_provider(model_id: &str, provider: ExecutionProvider) -> Result<Clip> {
@@ -564,38 +594,69 @@ mod tests {
     #[test]
     fn select_diverse_top_k_skips_near_duplicates() {
         let ranked = vec![(0, 0.90), (1, 0.89), (2, 0.50)];
-        let embeddings = array![
+        // Rows are pre-normalized (unit vectors), as TaggingEngine normalizes at load.
+        let mut embeddings = array![
             [1.0, 0.0],
             [0.9999, 0.0001], // near-duplicate of row 0
             [0.0, 1.0]
         ];
+        l2_normalize_rows(&mut embeddings);
 
         let out = select_diverse_top_k(&ranked, &embeddings, 2, 0.95);
-
         assert_eq!(out, vec![(0, 0.90), (2, 0.50)]);
     }
 
     #[test]
     fn select_diverse_top_k_falls_back_to_fill_requested_k() {
         let ranked = vec![(0, 0.90), (1, 0.89), (2, 0.88)];
-        let embeddings = array![[1.0, 0.0], [0.9999, 0.0001], [0.9998, 0.0002]];
+        let mut embeddings = array![[1.0, 0.0], [0.9999, 0.0001], [0.9998, 0.0002]];
+        l2_normalize_rows(&mut embeddings);
 
         let out = select_diverse_top_k(&ranked, &embeddings, 2, 0.95);
-
         assert_eq!(out, vec![(0, 0.90), (1, 0.89)]);
     }
 
     #[test]
     fn select_diverse_top_k_handles_zero_norm_rows() {
         let ranked = vec![(0, 0.90), (1, 0.89), (2, 0.88)];
-        let embeddings = array![
-            [0.0, 0.0], // zero vector should produce 0 cosine similarity
+        let mut embeddings = array![
+            [0.0, 0.0], // zero vector stays zero after normalization → cosine == 0
             [0.0, 0.0],
             [1.0, 0.0]
         ];
+        l2_normalize_rows(&mut embeddings);
 
         let out = select_diverse_top_k(&ranked, &embeddings, 2, 0.95);
-
         assert_eq!(out, vec![(0, 0.90), (1, 0.89)]);
+    }
+
+    #[test]
+    fn partial_rank_returns_top_scores_sorted() {
+        let probs = vec![0.1, 0.9, 0.4, 0.7, 0.2, 0.5];
+        let ranked = partial_rank(&probs, 3);
+        let scores: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
+        assert_eq!(scores[0], 0.9);
+        assert_eq!(scores[1], 0.7);
+        assert_eq!(scores[2], 0.5);
+        // limit clamps to MIN_RANKING_CANDIDATES or smaller when n < limit.
+        assert_eq!(ranked.len(), probs.len());
+    }
+
+    #[test]
+    fn partial_rank_breaks_ties_by_index_ascending() {
+        let probs = vec![0.5, 0.5, 0.5];
+        let ranked = partial_rank(&probs, 2);
+        assert_eq!(ranked[0].0, 0);
+        assert_eq!(ranked[1].0, 1);
+    }
+
+    #[test]
+    fn l2_normalize_rows_makes_unit_length() {
+        let mut m = array![[3.0_f32, 4.0], [1.0, 0.0]];
+        l2_normalize_rows(&mut m);
+        let n0 = (m[[0, 0]].powi(2) + m[[0, 1]].powi(2)).sqrt();
+        let n1 = (m[[1, 0]].powi(2) + m[[1, 1]].powi(2)).sqrt();
+        assert!((n0 - 1.0).abs() < 1e-6);
+        assert!((n1 - 1.0).abs() < 1e-6);
     }
 }
