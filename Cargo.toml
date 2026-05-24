@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/clip-tag-cli",
+    "crates/clip-tag-core",
+    "crates/clip-tag-image",
+    "crates/clip-tag-model",
+    "crates/clip-tag-metadata",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.78"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+hf-hub = "0.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
+open_clip_inference = { version = "0.4", default-features = false, features = ["hf-hub"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+
+clip-tag-core = { path = "crates/clip-tag-core" }
+clip-tag-image = { path = "crates/clip-tag-image" }
+clip-tag-model = { path = "crates/clip-tag-model" }
+clip-tag-metadata = { path = "crates/clip-tag-metadata" }
+
+[profile.release]
+lto = true
+strip = "symbols"
+panic = "abort"
