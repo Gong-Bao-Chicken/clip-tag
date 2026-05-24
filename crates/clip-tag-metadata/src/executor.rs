@@ -1,5 +1,7 @@
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use clip_tag_core::write::{FieldSnapshot, MetadataField, WritePlan};
 
@@ -23,26 +25,144 @@ fn json_keys(field: MetadataField) -> &'static [&'static str] {
     }
 }
 
-fn exiftool_json(path: &Path, tags: &[&str]) -> Result<serde_json::Value> {
-    let mut cmd = Command::new(EXIFTOOL);
-    cmd.arg("-json").arg("-n");
-    for tag in tags {
-        cmd.arg(format!("-{tag}"));
-    }
-    cmd.arg(path);
+/// Long-lived ExifTool process driven via `-stay_open True -@ -`.
+///
+/// ExifTool startup is ~250 ms on macOS — fork+exec dominates wall time when
+/// reading/writing thousands of files. The daemon keeps one process resident
+/// and pipes per-file commands in.
+struct ExifToolDaemon {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    counter: u64,
+}
 
-    let output = cmd
+impl ExifToolDaemon {
+    fn spawn() -> std::io::Result<Self> {
+        let mut child = Command::new(EXIFTOOL)
+            .arg("-stay_open")
+            .arg("True")
+            .arg("-@")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let stderr = child.stderr.take().expect("stderr");
+        // Drain stderr so the daemon never blocks on a full pipe.
+        std::thread::spawn(move || drain(stderr));
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            counter: 0,
+        })
+    }
+
+    fn execute(&mut self, args: &[&str]) -> Result<String> {
+        self.counter += 1;
+        let n = self.counter;
+        for arg in args {
+            writeln!(self.stdin, "{arg}").map_err(|e| Error::Read(e.to_string()))?;
+        }
+        writeln!(self.stdin, "-execute{n}").map_err(|e| Error::Read(e.to_string()))?;
+        self.stdin.flush().map_err(|e| Error::Read(e.to_string()))?;
+
+        let sentinel = format!("{{ready{n}}}");
+        let mut out = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|e| Error::Read(e.to_string()))?;
+            if read == 0 {
+                return Err(Error::Read("exiftool daemon closed unexpectedly".into()));
+            }
+            if line.trim_end_matches(&['\r', '\n'][..]) == sentinel {
+                break;
+            }
+            out.push_str(&line);
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for ExifToolDaemon {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin, "-stay_open\nFalse\n-execute");
+        let _ = self.stdin.flush();
+        let _ = self.child.wait();
+    }
+}
+
+fn drain<R: Read>(mut r: R) {
+    let mut buf = [0u8; 4096];
+    while r.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+}
+
+/// Process-wide daemon handle. `None` means the daemon failed to spawn and
+/// callers should fall back to per-call `Command::new("exiftool")`.
+static DAEMON: OnceLock<Option<Mutex<ExifToolDaemon>>> = OnceLock::new();
+
+fn daemon() -> Option<&'static Mutex<ExifToolDaemon>> {
+    DAEMON
+        .get_or_init(|| match ExifToolDaemon::spawn() {
+            Ok(d) => {
+                tracing::debug!("exiftool stay-open daemon ready");
+                Some(Mutex::new(d))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "exiftool stay-open daemon unavailable ({e}); falling back to per-call spawn",
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
+fn run_exiftool(args: &[&str]) -> Result<String> {
+    if let Some(d) = daemon() {
+        let mut guard = d
+            .lock()
+            .map_err(|e| Error::Read(format!("exiftool daemon mutex poisoned: {e}")))?;
+        return guard.execute(args);
+    }
+
+    let output = Command::new(EXIFTOOL)
+        .args(args)
         .output()
         .map_err(|e| Error::Read(format!("failed to run exiftool: {e}")))?;
     if !output.status.success() {
         return Err(Error::Read(format!(
-            "exiftool read failed: {}",
+            "exiftool failed: {}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }
+    String::from_utf8(output.stdout).map_err(|e| Error::Read(e.to_string()))
+}
 
+fn exiftool_json(path: &Path, tags: &[&str]) -> Result<serde_json::Value> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| Error::Read(format!("non-UTF8 path: {}", path.display())))?;
+
+    let mut args: Vec<String> = Vec::with_capacity(tags.len() + 3);
+    args.push("-json".into());
+    args.push("-n".into());
+    for tag in tags {
+        args.push(format!("-{tag}"));
+    }
+    args.push(path_str.into());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let stdout = run_exiftool(&arg_refs)?;
     let rows: Vec<serde_json::Value> =
-        serde_json::from_slice(&output.stdout).map_err(|e| Error::Read(e.to_string()))?;
+        serde_json::from_str(&stdout).map_err(|e| Error::Read(e.to_string()))?;
     Ok(rows.into_iter().next().unwrap_or(serde_json::json!({})))
 }
 
@@ -93,9 +213,13 @@ pub fn execute_plan(path: &Path, plan: &WritePlan, dry_run: bool) -> Result<()> 
         return Ok(());
     }
 
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| Error::Write(format!("non-UTF8 path: {}", path.display())))?;
+
     let mut written = std::collections::BTreeSet::new();
-    let mut cmd = Command::new(EXIFTOOL);
-    cmd.arg("-overwrite_original");
+    let mut args: Vec<String> = Vec::new();
+    args.push("-overwrite_original".into());
 
     for op in plan.operations() {
         for tag in field_tags(op.field) {
@@ -103,24 +227,18 @@ pub fn execute_plan(path: &Path, plan: &WritePlan, dry_run: bool) -> Result<()> 
                 continue;
             }
             if op.overwrite {
-                cmd.arg(format!("-{tag}="));
+                args.push(format!("-{tag}="));
             }
             for value in &op.values {
-                cmd.arg(format!("-{tag}={value}"));
+                args.push(format!("-{tag}={value}"));
             }
         }
     }
 
-    cmd.arg(path);
-    let output = cmd
-        .output()
-        .map_err(|e| Error::Write(format!("failed to run exiftool: {e}")))?;
-    if !output.status.success() {
-        return Err(Error::Write(format!(
-            "exiftool write failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+    args.push(path_str.into());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    run_exiftool(&arg_refs).map_err(|e| Error::Write(e.to_string()))?;
     Ok(())
 }
 

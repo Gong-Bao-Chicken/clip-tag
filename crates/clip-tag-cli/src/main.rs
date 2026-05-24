@@ -155,7 +155,12 @@ fn quality_defaults(quality: QualityArg) -> QualityDefaults {
 }
 
 fn main() -> anyhow::Result<()> {
-    logging::init();
+    let cli = Cli::parse();
+    if cli.dry_run {
+        logging::init_quiet();
+    } else {
+        logging::init();
+    }
 
     pipeline::set_metadata_hooks(MetadataIoHooks {
         read_snapshot: |p| {
@@ -166,7 +171,6 @@ fn main() -> anyhow::Result<()> {
         },
     });
 
-    let cli = Cli::parse();
     let preset = quality_defaults(cli.quality);
     let top_k = cli.top_k.unwrap_or(preset.top_k);
     let threshold = cli.threshold.unwrap_or(preset.threshold);
@@ -241,6 +245,12 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn print_text(result: &clip_tag_core::BatchResult) {
+    let is_dry_run = result
+        .files
+        .iter()
+        .any(|f| f.write.as_ref().and_then(|w| w.dry_run.as_ref()).is_some());
+
+    // Errors and tag listings always go first so they're easy to skim.
     for file in &result.files {
         if let Some(err) = &file.error {
             eprintln!("{}: error: {err}", file.path);
@@ -249,7 +259,15 @@ fn print_text(result: &clip_tag_core::BatchResult) {
         for tag in &file.tags {
             println!("{}\t{}\t{:.4}", file.path, tag.label, tag.score);
         }
-        if let Some(write) = &file.write {
+    }
+
+    // Metadata write outcomes (or dry-run plans) go in a separate block at the
+    // end so a long batch doesn't interleave tag rows with plan blocks.
+    if is_dry_run {
+        println!();
+        println!("--- dry-run write plan ---");
+        for file in &result.files {
+            let Some(write) = &file.write else { continue };
             println!("{}: metadata: {}", file.path, write.decision);
             if let Some(dry) = &write.dry_run {
                 for op in &dry.operations {
@@ -259,6 +277,11 @@ fn print_text(result: &clip_tag_core::BatchResult) {
                     );
                 }
             }
+        }
+    } else {
+        for file in &result.files {
+            let Some(write) = &file.write else { continue };
+            println!("{}: metadata: {}", file.path, write.decision);
         }
     }
 }
