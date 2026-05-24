@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod external_data;
 pub mod vocab;
 pub mod vocab_cache;
 

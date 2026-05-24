@@ -7,6 +7,7 @@ use ndarray::{Array2, ArrayView1};
 use open_clip_inference::clip::Clip;
 use ort::ep::{ExecutionProviderDispatch, CPU};
 
+use crate::external_data;
 use crate::vocab;
 use crate::vocab_cache;
 use crate::{Error, Result, DEFAULT_MODEL_ID};
@@ -301,7 +302,8 @@ fn partial_rank(probs: &[f32], top_k: usize) -> Vec<(usize, f32)> {
 
 async fn load_clip_with_provider(model_id: &str, provider: ExecutionProvider) -> Result<Clip> {
     let providers = build_execution_providers(provider)?;
-    load_clip(model_id, &providers).await
+    let requires_internal_data = provider_requires_internal_data(provider);
+    load_clip(model_id, &providers, requires_internal_data).await
 }
 
 /// Build the execution-provider chain for a requested provider.
@@ -409,12 +411,128 @@ fn cuda_chain() -> Result<Vec<ExecutionProviderDispatch>> {
     ))
 }
 
-async fn load_clip(model_id: &str, providers: &[ExecutionProviderDispatch]) -> Result<Clip> {
-    let model_dir = resolve_model_dir(model_id).await?;
+async fn load_clip(
+    model_id: &str,
+    providers: &[ExecutionProviderDispatch],
+    requires_internal_data: bool,
+) -> Result<Clip> {
+    let raw_dir = resolve_model_dir(model_id).await?;
+    let model_dir = if requires_internal_data {
+        ensure_folded_model_dir(model_id, &raw_dir)?
+    } else {
+        raw_dir
+    };
     Clip::from_local_dir(&model_dir)
         .with_execution_providers(providers)
         .build()
         .map_err(|e| Error::Load(e.to_string()))
+}
+
+/// True for execution providers whose graph optimizer hits the ORT
+/// `model_path must not be empty` assertion when the model uses external
+/// data initializers. CPU is fine on its own; everything else partitions
+/// the graph and can lose the path context.
+fn provider_requires_internal_data(provider: ExecutionProvider) -> bool {
+    !matches!(provider, ExecutionProvider::Cpu)
+}
+
+/// Return a model dir that is guaranteed not to use external-data
+/// initializers, copying / folding from `raw_dir` if needed.
+///
+/// The folded copy lives under
+/// `~/.cache/clip-tag/folded-models/<sanitized-model-id>/` and is keyed by
+/// the sizes of the source `.onnx` / `.onnx.data` files. If the user
+/// updates the HF cache (e.g. a new model revision), file sizes change
+/// and the fold is redone.
+fn ensure_folded_model_dir(model_id: &str, raw_dir: &Path) -> Result<PathBuf> {
+    let text_onnx = raw_dir.join("text.onnx");
+    let visual_onnx = raw_dir.join("visual.onnx");
+
+    let text_external = external_data::has_external_data(&text_onnx)?;
+    let visual_external = external_data::has_external_data(&visual_onnx)?;
+    if !text_external && !visual_external {
+        return Ok(raw_dir.to_path_buf());
+    }
+
+    let folded_dir = folded_model_dir_path(model_id)?;
+    let marker = fold_cache_marker(raw_dir)?;
+    let marker_path = folded_dir.join("_FOLD_DONE");
+    if marker_path.exists()
+        && std::fs::read_to_string(&marker_path)
+            .map(|s| s == marker)
+            .unwrap_or(false)
+    {
+        return Ok(folded_dir);
+    }
+
+    tracing::info!(
+        src = %raw_dir.display(),
+        dst = %folded_dir.display(),
+        "folding external-data initializers (one-time per model revision)",
+    );
+    populate_folded_dir(raw_dir, &folded_dir)?;
+    std::fs::write(&marker_path, marker)
+        .map_err(|e| Error::Load(format!("write fold marker: {e}")))?;
+    Ok(folded_dir)
+}
+
+fn folded_model_dir_path(model_id: &str) -> Result<PathBuf> {
+    let base = dirs::cache_dir()
+        .ok_or_else(|| Error::Load("no cache dir".into()))?
+        .join("clip-tag")
+        .join("folded-models");
+    let sanitized = model_id
+        .replace('/', "__")
+        .replace('\\', "__")
+        .replace(':', "_");
+    Ok(base.join(sanitized))
+}
+
+fn fold_cache_marker(raw_dir: &Path) -> Result<String> {
+    let entries = ["text.onnx", "visual.onnx", "text.onnx.data", "visual.onnx.data"];
+    let mut parts = Vec::with_capacity(entries.len() + 1);
+    parts.push("FOLD_V1".to_string());
+    for name in entries {
+        let path = raw_dir.join(name);
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        parts.push(format!("{name}={size}"));
+    }
+    Ok(parts.join("\n"))
+}
+
+fn populate_folded_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).map_err(|e| Error::Load(e.to_string()))?;
+
+    for entry in std::fs::read_dir(src).map_err(|e| Error::Load(e.to_string()))? {
+        let entry = entry.map_err(|e| Error::Load(e.to_string()))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().to_string();
+        let src_path = src.join(&name);
+        let dst_path = dst.join(&name);
+
+        if name_str.ends_with(".onnx.data") {
+            // External data is being inlined; drop the sidecar.
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|e| Error::Load(e.to_string()))?;
+        if name_str == "text.onnx" || name_str == "visual.onnx" {
+            external_data::fold_onnx_file(&src_path, &dst_path)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            std::fs::copy(&src_path, &dst_path)
+                .map_err(|e| Error::Load(format!("copy {}: {e}", src_path.display())))?;
+        }
+    }
+
+    // `open_clip_inference::verify_model_dir` requires the `.onnx.data`
+    // sidecars to exist even when not referenced. Touch empty ones — the
+    // folded ONNX no longer points at them, so ORT won't read them.
+    for sidecar in OPTIONAL_DATA_SIDECARS {
+        let path = dst.join(sidecar);
+        if !path.exists() {
+            std::fs::write(&path, []).map_err(|e| Error::Load(e.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 const REQUIRED_MODEL_FILES: &[&str] = &[
