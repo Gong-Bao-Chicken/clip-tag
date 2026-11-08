@@ -1,8 +1,19 @@
 use std::path::{Path, PathBuf};
 
 use clip_tag_model::{ModelConfig, SharedEngine, TagScore, TaggingEngine};
+use image::DynamicImage;
 use rayon::prelude::*;
 use walkdir::WalkDir;
+
+enum Prep {
+    Skip(FileTagResult),
+    Decoded(DynamicImage),
+}
+
+enum ChunkPrep {
+    Ready(FileTagResult),
+    Pending { path: PathBuf, image: DynamicImage },
+}
 
 use crate::config::{BatchConfig, Config, WriteConfig};
 use crate::dry_run::DryRunReport;
@@ -107,9 +118,178 @@ impl Pipeline {
             return batch_error_result(root, "no supported images found".to_string());
         }
 
-        run_batch_paths(paths, self.config.batch.continue_on_error, |path| {
-            self.process_file(path, top_k, threshold)
-        })
+        let batch_size = self.config.batch.batch_size.max(1);
+        let continue_on_error = self.config.batch.continue_on_error;
+
+        if batch_size <= 1 {
+            return run_batch_paths(paths, continue_on_error, |path| {
+                self.process_file(path, top_k, threshold)
+            });
+        }
+
+        self.run_batch_chunked(paths, top_k, threshold, batch_size, continue_on_error)
+    }
+
+    /// Process paths in chunks, calling [`TaggingEngine::tag_batch`] once per
+    /// chunk. Decoding and post-processing run in parallel within each chunk;
+    /// the model call itself is one ORT invocation across the whole chunk so
+    /// kernel-dispatch overhead is amortized.
+    fn run_batch_chunked(
+        &self,
+        paths: Vec<PathBuf>,
+        top_k: usize,
+        threshold: f32,
+        batch_size: usize,
+        continue_on_error: bool,
+    ) -> BatchResult {
+        let fetch_k = tag_fetch_k(top_k, threshold);
+        let mut files: Vec<FileTagResult> = Vec::with_capacity(paths.len());
+        let mut had_error = false;
+
+        for chunk in paths.chunks(batch_size) {
+            let chunk_results = self.process_chunk(chunk, fetch_k, top_k, threshold);
+            for r in chunk_results {
+                if r.error.is_some() {
+                    had_error = true;
+                }
+                files.push(r);
+            }
+            if had_error && !continue_on_error {
+                break;
+            }
+        }
+
+        let failed = files.iter().filter(|r| r.error.is_some()).count();
+        let succeeded = files.len().saturating_sub(failed);
+        BatchResult {
+            files,
+            succeeded,
+            failed,
+        }
+    }
+
+    fn process_chunk(
+        &self,
+        chunk: &[PathBuf],
+        fetch_k: usize,
+        top_k: usize,
+        threshold: f32,
+    ) -> Vec<FileTagResult> {
+        // Phase 1: precheck + decode in parallel. Each slot is one of:
+        //   - Ready: a fully-formed FileTagResult (skip or error).
+        //   - Pending: a decoded image awaiting batched inference.
+        let prepared: Vec<ChunkPrep> = chunk
+            .par_iter()
+            .map(|path| match self.prepare_for_inference(path) {
+                Ok(Prep::Skip(r)) => ChunkPrep::Ready(r),
+                Ok(Prep::Decoded(img)) => ChunkPrep::Pending {
+                    path: path.clone(),
+                    image: img,
+                },
+                Err(e) => ChunkPrep::Ready(FileTagResult {
+                    path: path.display().to_string(),
+                    tags: vec![],
+                    write: None,
+                    error: Some(e.to_string()),
+                }),
+            })
+            .collect();
+
+        // Phase 2: extract pending images for the single ORT call.
+        let mut pending_paths: Vec<PathBuf> = Vec::new();
+        let mut pending_images: Vec<DynamicImage> = Vec::new();
+        let mut pending_slot_indices: Vec<usize> = Vec::new();
+        let mut slots: Vec<Option<FileTagResult>> = Vec::with_capacity(prepared.len());
+
+        for (slot_idx, item) in prepared.into_iter().enumerate() {
+            match item {
+                ChunkPrep::Ready(r) => slots.push(Some(r)),
+                ChunkPrep::Pending { path, image } => {
+                    slots.push(None);
+                    pending_paths.push(path);
+                    pending_images.push(image);
+                    pending_slot_indices.push(slot_idx);
+                }
+            }
+        }
+
+        // Phase 3: one batched inference call.
+        let tag_results: Vec<Result<Vec<TagScore>>> = if pending_images.is_empty() {
+            Vec::new()
+        } else {
+            match self.engine.tag_batch(&pending_images, fetch_k) {
+                Ok(per_image) => per_image.into_iter().map(Ok).collect(),
+                Err(e) => {
+                    // Surface the inference failure on every pending file in the chunk.
+                    let msg = e.to_string();
+                    pending_images.iter().map(|_| Err(Error::Model(msg.clone()))).collect()
+                }
+            }
+        };
+        drop(pending_images);
+
+        // Phase 4: post-process (threshold filter + metadata write) in parallel.
+        let triples: Vec<(PathBuf, Result<Vec<TagScore>>, usize)> = pending_paths
+            .into_iter()
+            .zip(tag_results.into_iter())
+            .zip(pending_slot_indices.into_iter())
+            .map(|((p, t), s)| (p, t, s))
+            .collect();
+
+        let post: Vec<(usize, FileTagResult)> = triples
+            .into_par_iter()
+            .map(|(path, tag_result, slot_idx)| {
+                let result = match tag_result {
+                    Ok(mut tags) => {
+                        tags = filter_tags_by_threshold(tags, threshold);
+                        tags.truncate(top_k);
+                        match self.maybe_write_metadata(&path, &tags) {
+                            Ok(write) => FileTagResult {
+                                path: path.display().to_string(),
+                                tags,
+                                write,
+                                error: None,
+                            },
+                            Err(e) => FileTagResult {
+                                path: path.display().to_string(),
+                                tags: vec![],
+                                write: None,
+                                error: Some(e.to_string()),
+                            },
+                        }
+                    }
+                    Err(e) => FileTagResult {
+                        path: path.display().to_string(),
+                        tags: vec![],
+                        write: None,
+                        error: Some(e.to_string()),
+                    },
+                };
+                (slot_idx, result)
+            })
+            .collect();
+
+        for (slot_idx, result) in post {
+            slots[slot_idx] = Some(result);
+        }
+
+        slots
+            .into_iter()
+            .map(|s| s.expect("every slot populated"))
+            .collect()
+    }
+
+    /// Per-file precheck + decode used by the chunked path.
+    fn prepare_for_inference(&self, path: &Path) -> Result<Prep> {
+        if let Some(skip) = self.precheck_skip_without_inference(path)? {
+            return Ok(Prep::Skip(skip));
+        }
+        let img = clip_tag_image::load_dynamic_for_inference(
+            path,
+            clip_tag_image::DEFAULT_MAX_INFERENCE_DIM,
+        )
+        .map_err(|e| Error::Image(e.to_string()))?;
+        Ok(Prep::Decoded(img))
     }
 
     fn process_file(&self, path: &Path, top_k: usize, threshold: f32) -> Result<FileTagResult> {
@@ -473,6 +653,7 @@ pub fn default_config_from_cli(
     provider: Option<String>,
     vocab_path: Option<PathBuf>,
     diversity_threshold: Option<f32>,
+    batch_size: usize,
 ) -> Config {
     Config {
         write: WriteConfig {
@@ -495,6 +676,7 @@ pub fn default_config_from_cli(
         batch: BatchConfig {
             recursive,
             continue_on_error: true,
+            batch_size: batch_size.max(1),
         },
     }
 }

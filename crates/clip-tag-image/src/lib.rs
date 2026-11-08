@@ -37,6 +37,14 @@ pub fn load_rgb8(path: &Path) -> Result<image::RgbImage> {
     Ok(rgb)
 }
 
+/// Same as [`load_rgb8_for_inference`] but returns a `DynamicImage`. Prefer
+/// this when feeding the result into a batched embedder that takes
+/// `&[DynamicImage]` — avoids a re-conversion.
+pub fn load_dynamic_for_inference(path: &Path, max_dim: u32) -> Result<DynamicImage> {
+    let rgb = load_rgb8_for_inference(path, max_dim)?;
+    Ok(DynamicImage::ImageRgb8(rgb))
+}
+
 /// Decode an image sized for CLIP inference.
 ///
 /// For JPEGs, tries the embedded EXIF thumbnail when it is large enough; this

@@ -62,6 +62,29 @@ cargo run -p clip-tag --release -- photo.jpg --model RuteNL/MobileCLIP2-S4-OpenC
 
 See [docs/models.md](docs/models.md) for tuning details and **alternative models** (MobileCLIP2 S0–S4, SigLIP, DFN ViT-H, etc.).
 
+## Hardware acceleration
+
+Execution providers are compiled in via Cargo features. The default build is CPU-only.
+
+```bash
+# Apple Silicon (Neural Engine + GPU via CoreML)
+cargo build --release -p clip-tag --features coreml
+
+# Windows GPU (DirectML)
+cargo build --release -p clip-tag --features directml
+
+# NVIDIA GPU (CUDA)
+cargo build --release -p clip-tag --features cuda
+```
+
+Pick the provider at runtime with `--provider {auto|cpu|coreml|directml|cuda}`. `auto` cascades from the best available accelerator down to CPU.
+
+Each provider has a predefined default model (see `clip_tag_model::recommended_model_for`). When `--model` is omitted, the CLI picks the recommended model for the chosen provider.
+
+## Batched inference
+
+`--batch-size N` controls how many images are scored per ORT call. Larger batches amortize per-call dispatch overhead (especially on accelerated providers); smaller batches reduce time-to-first-result on small folders. Defaults: 16 (fast) / 8 (balanced) / 4 (thorough).
+
 ## Model layout
 
 `--model` accepts either:
